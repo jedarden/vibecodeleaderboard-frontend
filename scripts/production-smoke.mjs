@@ -19,6 +19,7 @@ import { pathToFileURL } from 'node:url';
 export const DEFAULT_SITE_URL = 'https://vibecodeleaderboard.com';
 export const DEFAULT_USERNAME = 'octocat';
 export const DEFAULT_TIMEOUT_MS = 30_000;
+const SITE_NAME = 'Vibe Code Leaderboard';
 
 const SSE_EVENTS = new Set(['queued', 'started', 'scanning', 'scanned', 'complete', 'error']);
 
@@ -117,6 +118,70 @@ export function validateReportResponse(payload) {
   }
 
   return report;
+}
+
+// The /u/<username> profile page is user.html transformed by
+// functions/u/[username].js for link-preview crawlers. If the function does
+// not run, the /u/* redirect in _redirects serves the raw template with its
+// placeholder title and static OG tags — reject exactly that.
+export function validateProfileHtml(html, { username, profileUrl }) {
+  nonEmptyString(html, 'profile html');
+  nonEmptyString(username, 'profile username');
+  nonEmptyString(profileUrl, 'profile url');
+
+  const title = html.match(/<title>([\s\S]*?)<\/title>/i)?.[1]?.trim();
+  nonEmptyString(title, 'profile <title>');
+  assert.doesNotMatch(title, /loading/i,
+    'profile <title> is the un-injected user.html placeholder; functions/u/[username].js did not run');
+  assert.match(title, new RegExp(escapeRegExp(username), 'i'),
+    'profile <title> does not name the requested user');
+  assert.ok(title.endsWith(` - ${SITE_NAME}`), `profile <title> must end with " - ${SITE_NAME}"`);
+
+  const ogTitle = metaTagContent(html, 'property', 'og:title');
+  assert.equal(ogTitle, title, 'og:title does not match the injected <title>');
+  nonEmptyString(metaTagContent(html, 'property', 'og:description'), 'og:description');
+  nonEmptyString(metaTagContent(html, 'name', 'description'), 'meta description');
+
+  const image = metaTagContent(html, 'property', 'og:image');
+  nonEmptyString(image, 'og:image');
+  let imageUrl;
+  try {
+    imageUrl = new URL(image);
+  } catch {
+    throw new Error(`og:image is not an absolute URL: ${image}`);
+  }
+  assert.ok(
+    imageUrl.origin === new URL(profileUrl).origin
+      && (imageUrl.pathname === '/og-image.png' || imageUrl.pathname.startsWith('/og/')),
+    `og:image must be the site's /og/<username> or default /og-image.png, got ${image}`,
+  );
+
+  assert.equal(metaTagContent(html, 'property', 'og:url'), profileUrl,
+    'og:url does not match the fetched profile URL');
+  assert.equal(linkRelHref(html, 'canonical'), profileUrl,
+    'canonical link does not match the fetched profile URL');
+
+  return { title, image: imageUrl.href };
+}
+
+function metaTagContent(html, attribute, name) {
+  const marker = new RegExp(`\\b${attribute}\\s*=\\s*["']${escapeRegExp(name)}["']`, 'i');
+  for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
+    if (marker.test(tag)) {
+      return tag.match(/\bcontent\s*=\s*["']([^"']*)["']/i)?.[1] ?? null;
+    }
+  }
+  return null;
+}
+
+function linkRelHref(html, rel) {
+  const marker = new RegExp(`\\brel\\s*=\\s*["']${escapeRegExp(rel)}["']`, 'i');
+  const tag = (html.match(/<link\b[^>]*>/gi) || []).find(candidate => marker.test(candidate));
+  return tag?.match(/\bhref\s*=\s*["']([^"']*)["']/i)?.[1] ?? null;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?${}()|[\]\\]/g, '\\$&');
 }
 
 function validateSseEvent(eventName, data, state) {
@@ -298,6 +363,22 @@ async function checkSite(site, timeoutMs) {
   return payload;
 }
 
+async function checkProfilePage(site, username, timeoutMs) {
+  const profilePath = `/u/${encodeURIComponent(username)}`;
+  const response = await fetchWithTimeout(
+    endpoint(site, profilePath),
+    { headers: { Accept: 'text/html' } },
+    timeoutMs,
+  );
+  assert.equal(response.status, 200, `profile page ${profilePath} returned HTTP ${response.status}`);
+  assert.match(response.headers.get('content-type') || '', /text\/html/i, 'profile page must return HTML');
+  const html = await readTextWithTimeout(response, timeoutMs);
+  // The function echoes the request URL into og:url/canonical, so compare
+  // against the post-redirect URL the fetch actually landed on.
+  const profileUrl = new URL(response.url || endpoint(site, profilePath)).href;
+  return validateProfileHtml(html, { username, profileUrl });
+}
+
 async function checkApi(api, siteOrigin, username, timeoutMs) {
   const headers = { Origin: siteOrigin };
   const health = await fetchWithTimeout(endpoint(api, '/health'), { method: 'HEAD', headers }, timeoutMs);
@@ -382,13 +463,15 @@ export async function runSmoke({
   log(`production smoke: site ${site.origin}`);
   await checkSite(site, timeoutMs);
   log('  ok: site shell and leaderboard.json');
+  await checkProfilePage(site, username, timeoutMs);
+  log(`  ok: profile page /u/${username} injects title and OG tags`);
   const state = await checkApi(api, site.origin, username, timeoutMs);
   log(`  ok: API health, user/${username}, report SSE (${state.events.join(' → ')})`);
   return { site: site.origin, api: api.origin, username, events: state.events };
 }
 
 function usage() {
-  console.log(`Usage: node scripts/production-smoke.mjs\n\nEnvironment overrides:\n  SMOKE_SITE_URL       Site origin (default: ${DEFAULT_SITE_URL})\n  SMOKE_API_URL        API origin (default: https://api.<site-host>)\n  SMOKE_USERNAME       User used for /user and /report probes (default: ${DEFAULT_USERNAME})\n  SMOKE_TIMEOUT_MS     Per-request/stream timeout (default: ${DEFAULT_TIMEOUT_MS})`);
+  console.log(`Usage: node scripts/production-smoke.mjs\n\nEnvironment overrides:\n  SMOKE_SITE_URL       Site origin (default: ${DEFAULT_SITE_URL})\n  SMOKE_API_URL        API origin (default: https://api.<site-host>)\n  SMOKE_USERNAME       User used for the /u profile page and /user, /report probes (default: ${DEFAULT_USERNAME})\n  SMOKE_TIMEOUT_MS     Per-request/stream timeout (default: ${DEFAULT_TIMEOUT_MS})`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

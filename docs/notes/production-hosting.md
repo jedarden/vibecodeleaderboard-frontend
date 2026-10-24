@@ -33,7 +33,10 @@ repository.
   - `GET /` → 200, the leaderboard HTML shell
   - `GET /leaderboard.json` → 200, `application/json`
   - `GET /u/octocat` → 200 with function-injected `<title>`/OG tags, so
-    `functions/u/[username].js` runs in production
+    `functions/u/[username].js` runs in production. The 2026-09-17 check was
+    manual; `scripts/production-smoke.mjs` (`make smoke-production`) now
+    fetches `/u/<SMOKE_USERNAME>` on every run and asserts the injected
+    title, OG tags, and canonical link.
 - All three custom domains are attached to the project, each `pending` with
   `verification_data` "CNAME record not set" and HTTP-01 validation
   (Google CA):

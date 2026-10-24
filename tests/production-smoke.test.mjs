@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 
+import { generateOGMetaTags, injectOGTags } from '../functions/u/[username].js';
 import {
   runSmoke,
   validateLeaderboard,
+  validateProfileHtml,
   validateReportResponse,
   validateUserResponse,
 } from '../scripts/production-smoke.mjs';
@@ -37,8 +40,11 @@ const LEADERBOARD = {
 
 let server;
 let baseUrl;
+let userTemplate;
 
 before(async () => {
+  userTemplate = await readFile(new URL('../user.html', import.meta.url), 'utf8');
+
   let releaseStream;
   const streamReady = new Promise((resolve) => { releaseStream = resolve; });
 
@@ -64,6 +70,16 @@ before(async () => {
     if (url.pathname === '/user/octocat' && request.method === 'GET') {
       response.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
       response.end(JSON.stringify({ ...LEADERBOARD.rankings[0], total_ranked: 10 }));
+      return;
+    }
+    if (url.pathname === '/u/octocat' && request.method === 'GET') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // Render against the real origin (port included) so og:url,
+      // og:image, and canonical match the URL the runner fetched.
+      response.end(injectOGTags(
+        userTemplate,
+        generateOGMetaTags('octocat', LEADERBOARD.rankings[0], new URL(request.url, baseUrl)),
+      ));
       return;
     }
     if (url.pathname === '/report/octocat/stream' && request.method === 'GET') {
@@ -110,6 +126,52 @@ test('production smoke runner checks site, data, API, and report SSE end-to-end'
   });
 
   assert.deepEqual(result.events, ['queued', 'started', 'scanning', 'scanned', 'complete']);
+});
+
+test('profile page smoke validates the function-injected title and OG tags', () => {
+  const profileUrl = `${baseUrl}/u/octocat`;
+  const at = new URL(profileUrl);
+  const render = (username, userData) => injectOGTags(userTemplate, generateOGMetaTags(username, userData, at));
+
+  assert.equal(
+    validateProfileHtml(render('octocat', LEADERBOARD.rankings[0]), { username: 'octocat', profileUrl }).title,
+    '#1 octocat - Vibe Code Leaderboard',
+  );
+
+  // A username that is not on the leaderboard still gets injected metadata,
+  // just without the rank prefix and with the default OG image.
+  assert.equal(
+    validateProfileHtml(render('ghost', null), { username: 'ghost', profileUrl }).title,
+    'ghost - Vibe Code Leaderboard',
+  );
+});
+
+test('profile page smoke rejects the un-injected template and broken injections', () => {
+  const profileUrl = `${baseUrl}/u/octocat`;
+  const opts = { username: 'octocat', profileUrl };
+  const injected = injectOGTags(
+    userTemplate,
+    generateOGMetaTags('octocat', LEADERBOARD.rankings[0], new URL(profileUrl)),
+  );
+
+  // _redirects serves user.html raw when the Pages function is missing.
+  assert.throws(() => validateProfileHtml(userTemplate, opts), /placeholder/);
+  assert.throws(() => validateProfileHtml(injected.replace(
+    'property="og:title" content="#1 octocat - Vibe Code Leaderboard"',
+    'property="og:title" content="Vibe Code Leaderboard"',
+  ), opts), /og:title/);
+  assert.throws(() => validateProfileHtml(injected.replace(
+    /property="og:url" content="[^"]*"/,
+    'property="og:url" content="https://elsewhere.example/u/octocat"',
+  ), opts), /og:url/);
+  assert.throws(() => validateProfileHtml(injected.replace(
+    /rel="canonical" href="[^"]*"/,
+    'rel="canonical" href="https://elsewhere.example/u/octocat"',
+  ), opts), /canonical/);
+  assert.throws(() => validateProfileHtml(injected.replace(
+    /property="og:image" content="[^"]*"/,
+    'property="og:image" content="not a url"',
+  ), opts), /og:image/);
 });
 
 test('documented response validators reject missing required shapes', () => {
